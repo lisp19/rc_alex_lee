@@ -1,0 +1,6 @@
+.git
+bin
+.env
+configs/secrets
+*.pem
+*.key

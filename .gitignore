@@ -1,0 +1,6 @@
+/bin/
+/.env
+/configs/secrets/
+*.log
+*.pem
+*.key
