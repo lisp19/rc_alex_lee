@@ -171,9 +171,13 @@ func (s *Store) Attempts(ctx context.Context, id domain.ID) ([]Attempt, error) {
 	items := make([]Attempt, 0)
 	for rows.Next() {
 		var a Attempt
-		if err = rows.Scan(&a.Number, &a.Generation, &a.Started, &a.Finished, &a.Status, &a.Result, &a.Error, &a.Latency, &a.Report); err != nil {
+		// SQL NULL is supported by *[]byte, but not by *json.RawMessage.
+		// An attempt without a Hook legitimately stores a NULL report.
+		var report []byte
+		if err = rows.Scan(&a.Number, &a.Generation, &a.Started, &a.Finished, &a.Status, &a.Result, &a.Error, &a.Latency, &report); err != nil {
 			return nil, err
 		}
+		a.Report = report
 		items = append(items, a)
 	}
 	return items, rows.Err()
