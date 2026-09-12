@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the committed case design exclusively against the deployed real system."""
+"""Run end-to-end cases against the Docker Compose deployment."""
 import argparse
 from collections import Counter
 import copy

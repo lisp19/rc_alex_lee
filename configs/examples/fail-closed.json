@@ -1,0 +1,21 @@
+{
+  "clients": {
+    "quota-client": {"enabled": true, "targets": ["quota-target"], "manual_retry": false, "quota_policy": "strict"}
+  },
+  "retry_policies": {
+    "bounded": {"revision": 1, "delays": ["5s", "30s"], "max_duration": "10m", "respect_retry_after": true}
+  },
+  "quota_policies": {
+    "strict": {"ingress_global": 100, "ingress_client": 10, "egress_target": 1, "egress_client_target": 1, "global_concurrency": 16, "target_concurrency": 1, "fail_mode": "closed"}
+  },
+  "hooks": {},
+  "issuers": {},
+  "targets": {
+    "quota-target": {
+      "revision": 1, "enabled": true, "adapter": "generic_http",
+      "endpoint": {"base_url": "http://mock-target:8080", "allowed_hosts": ["mock-target"], "allowed_methods": ["POST"], "allowed_path_prefixes": ["/d"], "allowed_cidrs": ["172.29.0.0/24"], "allow_http": true, "connect_timeout": "2s", "request_timeout": "10s", "max_response_bytes": 1048576},
+      "auth": {"type": "none"}, "idempotency": {"mode": "supported", "inject": [{"location": "header", "key": "Idempotency-Key"}]},
+      "retry_enabled": true, "retry_policy": "bounded", "quota_policy": "strict", "default_mode": "async", "allow_proxy": false, "preview_bytes": 8192
+    }
+  }
+}

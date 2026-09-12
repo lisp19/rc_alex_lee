@@ -1,6 +1,6 @@
 #!/bin/sh
 set -eu
-# Future local acceptance only. Every operation is explicit.
+# Control failure conditions in the local Compose deployment.
 test -f deploy/compose.yaml || { printf '%s\n' 'run from repository root' >&2; exit 1; }
 case "${1:-}" in
   kill-notifier) docker compose --env-file .env -f deploy/compose.yaml kill -s SIGKILL notifier ;;

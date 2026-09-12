@@ -1,4 +1,4 @@
-// Mock targets are only for the later integration acceptance phase.
+// mock-target serves deterministic HTTP responses and request observations.
 package main
 
 import (

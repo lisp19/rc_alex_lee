@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Add isolated business contexts through the normal transactional admin path."""
-import copy
+"""Apply the versioned smoke configuration and wait for both instances to load it."""
 import json
 import pathlib
 import time
@@ -10,19 +9,10 @@ from health import health
 
 path = pathlib.Path("configs/secrets/management.json")
 document = json.loads(path.read_text())
-# A/B/C/D model inventory sync, CRM business decisions, non-idempotent settlement,
-# and an advertising endpoint with explicit Retry-After.
-document["clients"]["audit-client"] = {"enabled": True, "targets": ["target-a"], "manual_retry": False, "quota_policy": "default"}
-document["quota_policies"]["smoke-egress"] = {**document["quota_policies"]["default"], "egress_target": 1}
-document["quota_policies"]["smoke-ingress"] = {**document["quota_policies"]["default"], "ingress_client": 1}
-limited = copy.deepcopy(document["targets"]["target-a"])
-limited["quota_policy"] = "smoke-egress"
-document["targets"]["target-limited"] = limited
-document["clients"]["limited-client"] = {"enabled": True, "targets": ["target-a"], "manual_retry": False, "quota_policy": "smoke-ingress"}
-if "target-limited" not in document["clients"]["demo-client"]["targets"]:
-    document["clients"]["demo-client"]["targets"].append("target-limited")
-# The file is a generated, ignored deployment input; history remains immutable
-# because notify-admin commits a new global revision rather than updating rows.
+example = json.loads(pathlib.Path("configs/management.example.json").read_text())
+for section in ("clients", "targets", "retry_policies", "quota_policies", "hooks"):
+    document[section].update(example[section])
+# Issuer keys remain those generated for this installation.
 path.write_text(json.dumps(document, indent=2)+"\n")
 compose("run", "--rm", "--no-deps", "config-init")
 revision = int(database("SELECT revision FROM config_revision WHERE scope='global'", "control"))

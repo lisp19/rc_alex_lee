@@ -1,12 +1,16 @@
 {
   "clients": {
-    "demo-client": {"enabled": true, "targets": ["target-a", "target-b", "target-c", "target-d"], "manual_retry": true, "quota_policy": "default"}
+    "demo-client": {"enabled": true, "targets": ["target-a", "target-b", "target-c", "target-d", "target-limited"], "manual_retry": true, "quota_policy": "default"},
+    "audit-client": {"enabled": true, "targets": ["target-a"], "manual_retry": false, "quota_policy": "default"},
+    "limited-client": {"enabled": true, "targets": ["target-a"], "manual_retry": false, "quota_policy": "smoke-ingress"}
   },
   "retry_policies": {
     "normal": {"revision": 1, "delays": ["5s", "30s", "2m", "10m", "30m", "2h", "6h"], "max_duration": "24h", "respect_retry_after": true}
   },
   "quota_policies": {
-    "default": {"ingress_global": 1000, "ingress_client": 100, "egress_target": 100, "egress_client_target": 50, "global_concurrency": 128, "target_concurrency": 8, "fail_mode": "open"}
+    "default": {"ingress_global": 1000, "ingress_client": 100, "egress_target": 100, "egress_client_target": 50, "global_concurrency": 128, "target_concurrency": 8, "fail_mode": "open"},
+    "smoke-ingress": {"ingress_global": 1000, "ingress_client": 1, "egress_target": 100, "egress_client_target": 50, "global_concurrency": 128, "target_concurrency": 8, "fail_mode": "open"},
+    "smoke-egress": {"ingress_global": 1000, "ingress_client": 100, "egress_target": 1, "egress_client_target": 50, "global_concurrency": 128, "target_concurrency": 8, "fail_mode": "open"}
   },
   "hooks": {
     "business-code": {"revision": 1, "expression": "{'action': json.code == 0 ? 'success' : (json.code == 1001 ? 'retry' : 'fail'), 'reason': 'vendor_business_code', 'report': {'vendor_code': json.code}}"}
@@ -30,6 +34,12 @@
       "endpoint": {"base_url": "http://mock-target:8080", "allowed_hosts": ["mock-target"], "allowed_methods": ["POST"], "allowed_path_prefixes": ["/c"], "allowed_cidrs": ["172.16.0.0/12"], "allow_http": true, "connect_timeout": "2s", "request_timeout": "10s", "max_response_bytes": 1048576},
       "auth": {"type": "none"}, "idempotency": {"mode": "unsupported", "allow_uncertain_retry": false},
       "retry_enabled": true, "retry_policy": "normal", "quota_policy": "default", "default_mode": "async", "allow_proxy": false, "preview_bytes": 8192
+    },
+    "target-limited": {
+      "revision": 1, "enabled": true, "adapter": "generic_http",
+      "endpoint": {"base_url": "http://mock-target:8080", "allowed_hosts": ["mock-target"], "allowed_methods": ["POST"], "allowed_path_prefixes": ["/a"], "allowed_cidrs": ["172.16.0.0/12"], "allow_http": true, "connect_timeout": "2s", "request_timeout": "10s", "max_response_bytes": 1048576},
+      "auth": {"type": "none"}, "idempotency": {"mode": "supported", "inject": [{"location": "header", "key": "Idempotency-Key"}]},
+      "retry_enabled": true, "retry_policy": "normal", "quota_policy": "smoke-egress", "default_mode": "async", "allow_proxy": true, "preview_bytes": 8192, "sensitive_json_fields": ["password", "email"]
     },
     "target-d": {
       "revision": 1, "enabled": true, "adapter": "generic_http",

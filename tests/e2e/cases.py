@@ -1,4 +1,4 @@
-"""Executable P0/P1/P2 end-to-end cases; see DESIGN.md for scope and oracles."""
+"""P0/P1/P2 end-to-end cases with API, database and supplier observations."""
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import copy

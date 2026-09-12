@@ -21,7 +21,7 @@ spec:
         seccompProfile: {type: RuntimeDefault}
       containers:
         - name: notifier
-          image: notifier:review-required
+          image: notifier:local
           imagePullPolicy: IfNotPresent
           env:
             - {name: NOTIFIER_CONFIG, value: /etc/notifier/notifier.json}

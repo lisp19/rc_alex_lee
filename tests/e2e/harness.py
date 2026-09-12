@@ -1,8 +1,4 @@
-"""Real-system E2E control plane. All generated inputs/evidence are ignored.
-
-No application package imports, mocked DB/MQ, patched clock or unit-test runner.
-SQL mutations are restricted to explicitly documented transport fault cases.
-"""
+"""Runtime environment, fault injection and observation helpers for E2E cases."""
 import base64
 import copy
 import datetime

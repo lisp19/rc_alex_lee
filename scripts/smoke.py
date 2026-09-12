@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Real two-instance E2E acceptance. Run after deploy-local and seed-smoke.
-
-Only generated local fixtures are used. Raw evidence goes to ignored .runtime/.
-This is an integration smoke runner, not a mocked implementation/unit test.
-"""
+"""Two-instance API, delivery and resource-control smoke scenarios."""
 import concurrent.futures
 import datetime
 import json

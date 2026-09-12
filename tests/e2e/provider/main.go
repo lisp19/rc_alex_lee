@@ -1,5 +1,4 @@
-// This is a real HTTP supplier simulator for end-to-end cases, not a unit-test
-// mock. Each case controls its own response sequence through query parameters.
+// HTTP supplier simulator with response sequences controlled by query parameters.
 package main
 
 import (
