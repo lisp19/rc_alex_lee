@@ -1,6 +1,11 @@
 .git
 bin
 .env
+.env.*
+.runtime
+coverage
+**/__pycache__
+**/*.pyc
 configs/secrets
 *.pem
 *.key

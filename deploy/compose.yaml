@@ -20,6 +20,11 @@ services:
   redis:
     image: redis:8.10.1
     command: [redis-server, --appendonly, 'no']
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 20
   rabbitmq:
     image: rabbitmq:4.3.5-management
     hostname: rabbitmq
@@ -28,12 +33,22 @@ services:
       RABBITMQ_DEFAULT_PASS: ${AMQP_PASSWORD:?required}
     volumes: [rabbitmq:/var/lib/rabbitmq]
     ports: ['127.0.0.1:15672:15672']
+    healthcheck:
+      test: [CMD, rabbitmq-diagnostics, -q, check_running]
+      interval: 5s
+      timeout: 5s
+      retries: 30
   mock-target:
     image: notifier:local
     build: {context: ..}
     entrypoint: [/mock-target]
     command: [-listen, ':8080']
-    ports: ['127.0.0.1:18080:8080']
+    ports: ['127.0.0.1:${NOTIFIER_MOCK_PORT:-18090}:8080']
+    healthcheck:
+      test: [CMD, /healthcheck, 'http://127.0.0.1:8080/health/live']
+      interval: 5s
+      timeout: 4s
+      retries: 20
   config-init:
     image: notifier:local
     build: {context: ..}
@@ -44,7 +59,7 @@ services:
     volumes: ['../configs/secrets/management.json:/etc/notifier/management.json:ro']
     depends_on:
       mariadb: {condition: service_healthy}
-  notifier:
+  notifier: &notifier
     image: notifier:local
     build: {context: ..}
     read_only: true
@@ -59,11 +74,20 @@ services:
       NOTIFIER_REDIS_URL: redis://redis:6379/0
     volumes: ['../configs/secrets/notifier.json:/etc/notifier/notifier.json:ro']
     ports: ['127.0.0.1:8080:8080', '127.0.0.1:8081:8081']
+    healthcheck:
+      test: [CMD, /healthcheck]
+      interval: 5s
+      timeout: 4s
+      retries: 30
+      start_period: 10s
     depends_on:
       config-init: {condition: service_completed_successfully}
-      redis: {condition: service_started}
-      rabbitmq: {condition: service_started}
-      mock-target: {condition: service_started}
+      redis: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+      mock-target: {condition: service_healthy}
+  notifier-2:
+    <<: *notifier
+    ports: ['127.0.0.1:8082:8080', '127.0.0.1:8083:8081']
 volumes:
   database: {}
   rabbitmq: {}

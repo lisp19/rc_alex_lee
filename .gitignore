@@ -1,5 +1,11 @@
 /bin/
 /.env
+/.env.*
+!/.env.example
+/.runtime/
+/coverage/
+__pycache__/
+*.pyc
 /configs/secrets/
 *.log
 *.pem

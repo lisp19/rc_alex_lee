@@ -1,6 +1,6 @@
 # 运行与管理手册
 
-以下启动和故障命令留待本轮 review 后使用，本阶段未执行。
+以下本地部署、初始化与双实例冒烟流程已经执行；结果见 [部署验收报告](deployment.md)。Kubernetes 部分仍为待平台接入的部署输入。
 
 ## 1. 本地准备与启动
 
@@ -8,8 +8,11 @@
 
 ```sh
 make build
-sh scripts/local-setup.sh
-docker compose --env-file .env -f deploy/compose.yaml up -d --build
+sh scripts/deploy-local.sh
+python3 scripts/seed-smoke.py
+python3 scripts/smoke.py
+python3 scripts/recovery-smoke.py
+python3 scripts/collect-runtime.py
 TOKEN=$(sh scripts/dev-token.sh)
 ```
 
@@ -17,7 +20,22 @@ TOKEN=$(sh scripts/dev-token.sh)
 
 Compose 在全新数据库卷中初始化 Schema 和账户，然后通过独立 `config-init` 作业写管理配置。运行进程只有管理库 SELECT 权限。生产迁移不能依赖应用启动或 Compose init，必须使用独立 Job/DBA 操作。
 
-访问：API `127.0.0.1:8080`、内部 Health `127.0.0.1:8081`、Mock `127.0.0.1:18080`、RabbitMQ 管理 `127.0.0.1:15672`。数据库和 Redis 不发布主机端口。
+访问：实例一 API/Health `127.0.0.1:8080` / `8081`；实例二 API/Health `127.0.0.1:8082` / `8083`；Mock `127.0.0.1:18090`、RabbitMQ 管理 `127.0.0.1:15672`。数据库和 Redis 不发布主机端口。Mock 端口可通过 `NOTIFIER_MOCK_PORT` 覆盖，运行冒烟时也需导出相同值。Compose 使用 `172.29.0.0/24` 专用网络，若与本机网络冲突，应同时调整网络与 Target IP 白名单。
+
+`deploy-local.sh` 检查工具与 Docker 可用性，按需生成本地配置，拉取三类中间件、构建应用，再按健康依赖顺序启动。Redis 使用 PING，RabbitMQ 使用 check_running，Mock 与应用使用镜像中的 Go `healthcheck` 命令（distroless 内无需 Shell/curl）。应用仅在数据库、有效配置及角色所需 MQ 可用后 Healthy。
+
+`seed-smoke.py` 在生成配置中增加审计 Client、独立入口限流 Client 和出口限流 Target，经 `notify-admin` 提交新 revision，并等待两个实例都加载该 revision。重复应用保留业务任务和历史版本；Compose 再次启动 config-init 时也可能推进 global revision。
+
+监控命令：
+
+```sh
+python3 scripts/health.py
+docker compose --env-file .env -f deploy/compose.yaml ps --all
+docker compose --env-file .env -f deploy/compose.yaml logs -f notifier notifier-2
+python3 scripts/collect-runtime.py
+```
+
+应用每 30 秒输出受理/投递/失败/重试、任务积压、MQ 错误、Lease 恢复、Quota 和配置刷新计数。进程计数在重启后清零，数据库积压是共享状态。Health detail 包含独立 instance_id，可核对两实例身份与配置收敛。
 
 ```sh
 curl -i http://127.0.0.1:8080/api/v1/notifications \
@@ -109,3 +127,19 @@ sh scripts/fault.sh start-mariadb
 SIGTERM：先 Not Ready，取消 consumer 拉取及周期 loop，HTTP Shutdown 停止新请求，等待进行中的 Attempt 完成并落库/ACK，45s 后取消剩余工作并关闭 MQ。Pod grace 55s 留出收尾时间。HA、备份/PITR、Quorum 副本和滚动漂移必须在后续环境验收中验证。
 
 历史保留期由运营策略决定，本实现不自动清除 Notification/Attempt/Outbox/config 历史。清理应由独立维护 Job 执行，必须同时保证上游幂等保留期和所有非终态任务的配置/请求仍存在。
+
+## 7. 本地状态与 Git 隔离
+
+| 内容 | 保存位置 | 是否入库 |
+|---|---|---|
+| 通用 Dockerfile、Compose/K8s、SQL、初始化/健康/冒烟脚本 | `deploy/`、`migrations/`、`scripts/`、`cmd/healthcheck/` | 是 |
+| 示例与脱敏后的验收结论 | `configs/*.example.json`、`docs/deployment.md` | 是 |
+| 本地数据库/MQ 密码 | `.env` | 否 |
+| JWT 私钥、公钥、包含公钥的实际管理配置 | `configs/secrets/` | 否 |
+| 原始日志、运行实例/镜像身份、任务 ID、失败及通过证据 | `.runtime/` | 否 |
+| 本地 Go 二进制、Python 缓存 | `bin/`、`__pycache__/` | 否 |
+| 中间件持久数据 | Docker named volumes `notifier_database`、`notifier_rabbitmq` | Docker 管理，不在工作树 |
+
+`.gitignore` 和 `.dockerignore` 均排除凭证/运行产物。不要将展开后的 `docker compose config` 或完整 `docker inspect` 输出提交到仓库，因为其中可包含环境凭证；校验使用 `config --quiet`，采集器只保存选定的非敏感字段。
+
+停止且保留数据：`docker compose --env-file .env -f deploy/compose.yaml down`。数据卷仅在明确需要重建本地数据时删除；现有数据卷不会重复执行 docker-entrypoint 建表/用户初始化。更改 `.env` 中数据库密码不会自动修改已有账户，需独立进行密码轮换。

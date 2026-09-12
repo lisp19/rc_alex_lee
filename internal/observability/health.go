@@ -13,6 +13,7 @@ import (
 	"notifier/internal/mq/rabbitmq"
 	"notifier/internal/quota"
 	"notifier/internal/recovery"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -34,6 +35,8 @@ type Health struct {
 
 func (h *Health) dependencies(ctx context.Context) (bool, map[string]any) {
 	detail := map[string]any{"draining": h.Draining.Load(), "roles": h.Roles}
+	instance, _ := os.Hostname()
+	detail["instance_id"] = instance
 	var dbOK, controlOK, redisOK bool
 	var wg sync.WaitGroup
 	wg.Add(3)

@@ -4,6 +4,8 @@ set -eu
 test -f configs/management.example.json || { printf '%s\n' 'run from repository root' >&2; exit 1; }
 test ! -e .env || { printf '%s\n' '.env already exists; retain existing credentials' >&2; exit 1; }
 test ! -e configs/secrets || { printf '%s\n' 'configs/secrets already exists; retain existing keys' >&2; exit 1; }
+command -v openssl > /dev/null
+command -v python3 > /dev/null
 umask 077
 mkdir -p configs/secrets
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out configs/secrets/jwt-private.pem

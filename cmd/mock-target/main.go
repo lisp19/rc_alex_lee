@@ -16,18 +16,30 @@ func main() {
 	flag.Parse()
 	var mu sync.Mutex
 	counts := map[string]int{}
+	records := map[string][]map[string]any{}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /health/live", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	mux.HandleFunc("GET /_admin/requests/{key}", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(records[r.PathValue("key")])
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("Idempotency-Key")
 		if key == "" {
 			key = r.Header.Get("X-Notification-ID")
 		}
+		var body map[string]any
+		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 2<<20)).Decode(&body)
 		mu.Lock()
 		if len(counts) > 100000 {
 			counts = map[string]int{}
+			records = map[string][]map[string]any{}
 		}
 		counts[key]++
 		count := counts[key]
+		records[key] = append(records[key], map[string]any{"received_at": time.Now().UTC(), "notification_id": r.Header.Get("X-Notification-ID"), "idempotency_key": key, "body_request_id": body["request_id"], "path": r.URL.Path, "attempt": count})
 		mu.Unlock()
 		q := r.URL.Query()
 		failures, _ := strconv.Atoi(q.Get("failures"))

@@ -4,7 +4,7 @@
 
 ## 当前交付状态
 
-已完成代码开发、三个命令的构建与非运行时 review。本阶段未拉取容器镜像、未启动中间件、未执行单元测试或集成/故障/性能验收。构建所需 Go modules 已解析并锁定。
+已完成代码开发、静态 review，以及本地双实例容器部署与真实验收：20 项基础端到端冒烟、3 项依赖/租约恢复检查均通过。详情见 [部署验收报告](docs/deployment.md)。生产 Kubernetes/HA 集群和性能压测尚未执行。
 
 - [实现选择与设计差异](docs/implementation.md)
 - [静态审查与后续验收](docs/review.md)
@@ -18,7 +18,19 @@ make build
 make check
 ```
 
-产物：`bin/notifier`、`bin/notify-admin`、`bin/mock-target`。`make check` 只执行 `go vet`、模块校验和 diff 空白检查；不会启动系统。产物已被 Git 忽略。
+产物：`bin/notifier`、`bin/notify-admin`、`bin/mock-target`、`bin/healthcheck`。`make check` 只执行 `go vet`、模块校验和 diff 空白检查；不会启动系统。产物已被 Git 忽略。
+
+## 双实例部署与冒烟
+
+```sh
+sh scripts/deploy-local.sh
+python3 scripts/seed-smoke.py
+python3 scripts/smoke.py
+python3 scripts/recovery-smoke.py
+python3 scripts/collect-runtime.py
+```
+
+两个实例 API 为 `127.0.0.1:8080` / `127.0.0.1:8082`，Health 为 `8081` / `8083`；Mock 使用 `18090`，RabbitMQ 管理使用 `15672`。恢复检查会临时停止本项目容器并恢复启动。凭证在 `.env` / `configs/secrets/`；原始验收记录在 `.runtime/`，均不进入 Git 或 Docker 构建上下文。
 
 ## 主要模块
 
