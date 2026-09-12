@@ -77,6 +77,10 @@ func decode(w http.ResponseWriter, r *http.Request, v any) error {
 		return application.Fail("INVALID_REQUEST", 400, "invalid JSON request")
 	}
 	if err := d.Decode(new(any)); err != io.EOF {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return application.Fail("INVALID_REQUEST", 413, "request exceeds 2 MiB")
+		}
 		return application.Fail("INVALID_REQUEST", 400, "expected one JSON object")
 	}
 	return nil
