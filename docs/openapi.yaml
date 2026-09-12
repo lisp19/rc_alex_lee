@@ -1,0 +1,268 @@
+openapi: 3.1.0
+info:
+  title: API Notification Delivery Service
+  version: 1.0.0
+  description: Durable HTTP delivery with at-least-once triggers and client-scoped idempotency.
+servers:
+  - url: https://notifier.example.internal
+security:
+  - bearerJWT: []
+paths:
+  /api/v1/notifications:
+    post:
+      operationId: createNotification
+      summary: Persist a notification and optionally wait for its first attempt
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Submission'}
+      responses:
+        '202':
+          description: Durably accepted or retry scheduled; may be an idempotent replay
+          headers:
+            Location: {schema: {type: string}}
+            X-Request-ID: {schema: {type: string, format: uuid}}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Notification'}
+        '200':
+          description: Terminal notification, including a completed proxy attempt
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Notification'}
+        '409': {$ref: '#/components/responses/Error'}
+        '429': {$ref: '#/components/responses/Error'}
+        default: {$ref: '#/components/responses/Error'}
+    get:
+      operationId: listNotifications
+      summary: List only the authenticated client's notifications
+      parameters:
+        - {name: status, in: query, schema: {$ref: '#/components/schemas/Status'}}
+        - {name: target, in: query, schema: {type: string}}
+        - {name: batch_id, in: query, schema: {type: string, format: uuid}}
+        - {name: cursor, in: query, schema: {type: string}, description: Opaque cursor; retain the same filters on subsequent requests}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 50}}
+      responses:
+        '200':
+          description: Descending UUIDv7 keyset page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: {type: array, items: {$ref: '#/components/schemas/Notification'}}
+                  next_cursor: {type: string, description: Empty when no next page}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/notifications:batch:
+    post:
+      operationId: createBatch
+      summary: Independently validate and persist up to 100 async items
+      description: HTTP request maximum is 2 MiB. Item failures never roll back other items. Batch IDs are correlation IDs, not idempotency keys.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 100
+                  items: {$ref: '#/components/schemas/BatchItem'}
+      responses:
+        '202':
+          description: Per-item results; inspect accepted and error.code
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [batch_id, results]
+                properties:
+                  batch_id: {type: string, format: uuid}
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      required: [idempotency_key, accepted]
+                      properties:
+                        idempotency_key: {type: string}
+                        accepted: {type: boolean}
+                        notification_id: {type: string, format: uuid}
+                        error:
+                          type: object
+                          properties:
+                            code: {type: string}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/notifications/{notification_id}:
+    parameters:
+      - {$ref: '#/components/parameters/NotificationID'}
+    get:
+      operationId: getNotification
+      summary: Query status and the newest 100 attempts without sensitive request data
+      responses:
+        '200':
+          description: Notification and attempts
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - {$ref: '#/components/schemas/Notification'}
+                  - type: object
+                    properties:
+                      attempts: {type: array, items: {$ref: '#/components/schemas/Attempt'}}
+        '404': {$ref: '#/components/responses/Error'}
+        default: {$ref: '#/components/responses/Error'}
+  /api/v1/notifications/{notification_id}:retry:
+    parameters:
+      - {$ref: '#/components/parameters/NotificationID'}
+    post:
+      operationId: retryNotification
+      summary: Open a new bounded retry cycle for a failed notification
+      description: Requires manual_retry permission, current target authorization and retained request/config snapshot. ID and downstream idempotency key remain unchanged. Concurrent retries are fenced by generation.
+      responses:
+        '202':
+          description: Retry persisted with a new Outbox
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Notification'}
+        '403': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        default: {$ref: '#/components/responses/Error'}
+  /health/live:
+    servers: [{url: 'http://127.0.0.1:8081'}]
+    get:
+      operationId: liveness
+      security: []
+      responses:
+        '200':
+          description: Process health event loop responds
+          content:
+            application/json:
+              schema: {type: object, properties: {live: {type: boolean}}}
+  /health/ready:
+    servers: [{url: 'http://127.0.0.1:8081'}]
+    get:
+      operationId: readiness
+      security: []
+      responses:
+        '200': {description: Role dependencies available and snapshot loaded}
+        '503': {description: Not ready or draining}
+  /health/detail:
+    servers: [{url: 'http://127.0.0.1:8081'}]
+    get:
+      operationId: detailedHealth
+      security: []
+      description: Separate management listener; only expose to trusted internal monitoring networks.
+      responses:
+        '200': {description: Dependency flags, revision, roles, worker count and degradation; no secrets}
+components:
+  securitySchemes:
+    bearerJWT: {type: http, scheme: bearer, bearerFormat: JWT}
+  parameters:
+    NotificationID:
+      name: notification_id
+      in: path
+      required: true
+      schema: {type: string, format: uuid}
+  responses:
+    Error:
+      description: Structured error; errors do not imply durable acceptance
+      headers:
+        X-Request-ID: {schema: {type: string, format: uuid}}
+        Retry-After: {schema: {type: string}, description: Present on quota rejection}
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error:
+                type: object
+                required: [code, message, request_id]
+                properties:
+                  code:
+                    type: string
+                    enum: [INVALID_REQUEST, UNAUTHORIZED, FORBIDDEN, TARGET_NOT_FOUND, TARGET_NOT_ALLOWED, TARGET_DISABLED, IDEMPOTENCY_CONFLICT, QUOTA_EXCEEDED, DEPENDENCY_UNAVAILABLE, NOTIFICATION_NOT_FOUND, INVALID_STATE, INTERNAL_ERROR]
+                  message: {type: string}
+                  request_id: {type: string, format: uuid}
+  schemas:
+    Request:
+      type: object
+      additionalProperties: false
+      required: [method, path]
+      properties:
+        method: {type: string, enum: [GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS]}
+        path: {type: string, maxLength: 2048, description: Decoded absolute path on the configured origin. No percent escapes, query, fragment, backslash or traversal segments.}
+        query: {type: object, maxProperties: 128, additionalProperties: {type: string}}
+        headers: {type: object, maxProperties: 64, additionalProperties: {type: string}, description: Authentication and hop-by-hop headers are forbidden}
+        body_encoding: {type: string, enum: [utf8, base64], default: utf8}
+        body: {type: string, description: At most 1 MiB after decoding}
+    Submission:
+      type: object
+      additionalProperties: false
+      required: [target, request]
+      properties:
+        target: {type: string, minLength: 1, maxLength: 64}
+        delivery_mode: {type: string, enum: [async, proxy], description: Defaults to Target configuration}
+        request: {$ref: '#/components/schemas/Request'}
+    BatchItem:
+      type: object
+      additionalProperties: false
+      required: [idempotency_key, target, request]
+      properties:
+        idempotency_key: {type: string, minLength: 1, maxLength: 128}
+        target: {type: string, minLength: 1, maxLength: 64}
+        delivery_mode: {type: string, const: async}
+        request: {$ref: '#/components/schemas/Request'}
+    Status:
+      type: string
+      enum: [pending, in_flight, delivered, failed]
+    Notification:
+      type: object
+      required: [notification_id, status, target, accepted_at]
+      properties:
+        notification_id: {type: string, format: uuid}
+        target: {type: string}
+        batch_id: {type: string, format: uuid}
+        status: {$ref: '#/components/schemas/Status'}
+        delivery_mode: {type: string, enum: [async, proxy]}
+        accepted_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
+        next_attempt_at: {type: string, format: date-time}
+        retry_deadline_at: {type: string, format: date-time}
+        attempt_count: {type: integer, minimum: 0}
+        dispatch_generation: {type: integer, minimum: 1}
+        target_revision: {type: integer}
+        retry_revision: {type: integer}
+        hook_revision: {type: integer}
+        config_revision: {type: integer}
+        last_http_status: {type: integer}
+        last_error_code: {type: string}
+        proxy_result:
+          type: object
+          properties:
+            status: {$ref: '#/components/schemas/Status'}
+            http_status: {type: integer}
+            error_code: {type: string}
+    Attempt:
+      type: object
+      properties:
+        attempt_no: {type: integer}
+        generation: {type: integer}
+        started_at: {type: string, format: date-time}
+        finished_at: {type: string, format: date-time}
+        http_status: {type: integer}
+        result: {type: string, enum: [started, success, retry, fail, unknown]}
+        error_code: {type: string}
+        latency_ms: {type: integer}
+        report: {}

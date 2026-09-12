@@ -33,6 +33,9 @@ type Worker struct {
 }
 
 func (w *Worker) Process(ctx context.Context, id domain.ID, generation uint64) error {
+	if domain.RequestID(ctx) == "" {
+		ctx = domain.WithRequestID(ctx, domain.NewID().String())
+	}
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	n, err := w.Store.Load(ctx, id)
@@ -61,6 +64,7 @@ func (w *Worker) Process(ctx context.Context, id domain.ID, generation uint64) e
 		return errors.New("configuration unavailable")
 	}
 	current, policyErr := application.Allowed(latest, n.Client, n.Target)
+	expired := !time.Now().Before(n.Deadline)
 	if w.Lock != nil {
 		release, ok, err := w.Lock.Acquire(ctx, id)
 		if err != nil {
@@ -71,7 +75,7 @@ func (w *Worker) Process(ctx context.Context, id domain.ID, generation uint64) e
 			defer release()
 		}
 	}
-	if w.Gate != nil && policyErr == nil {
+	if w.Gate != nil && policyErr == nil && !expired {
 		release, ok, err := w.Gate.Acquire(ctx, n, latest.Quotas[current.Quota])
 		if err != nil {
 			return w.Store.DeferPending(ctx, n, 5*time.Second)
@@ -96,7 +100,7 @@ func (w *Worker) Process(ctx context.Context, id domain.ID, generation uint64) e
 		}
 		if err != nil {
 			d.Reason = "secret_unavailable"
-		} else if n.CycleAttempts > 1 && !time.Now().Before(n.Deadline) {
+		} else if !time.Now().Before(n.Deadline) {
 			d.Reason = "retry_deadline_exceeded"
 		} else {
 			d = w.Adapter.Deliver(ctx, n, t, current, secret)
@@ -136,6 +140,6 @@ func (w *Worker) Process(ctx context.Context, id domain.ID, generation uint64) e
 	default:
 		w.Failed.Add(1)
 	}
-	slog.Info("delivery_finished", "notification_id", id, "client_id", n.Client, "target_id", n.Target, "attempt_no", n.Attempts, "generation", generation, "config_revision", historical.Revision, "result", d.Action, "http_status", d.HTTPStatus, "error_code", d.Reason, "latency_ms", d.Latency.Milliseconds())
+	slog.Info("delivery_finished", "request_id", domain.RequestID(ctx), "notification_id", id, "batch_id", n.Batch, "client_id", n.Client, "target_id", n.Target, "attempt_no", n.Attempts, "generation", generation, "config_revision", historical.Revision, "result", d.Action, "http_status", d.HTTPStatus, "error_code", d.Reason, "latency_ms", d.Latency.Milliseconds(), "hook_report", d.Report)
 	return nil
 }

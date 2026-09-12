@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"os"
@@ -17,13 +18,15 @@ import (
 )
 
 type Manager struct {
-	DB       *sql.DB
-	current  atomic.Pointer[Snapshot]
-	secrets  atomic.Pointer[map[string]string]
-	mu       sync.Mutex
-	history  map[uint64]*Snapshot
-	Reloads  atomic.Uint64
-	Failures atomic.Uint64
+	DB         *sql.DB
+	current    atomic.Pointer[Snapshot]
+	secrets    atomic.Pointer[map[string]string]
+	secretHash [32]byte
+	secretMu   sync.Mutex
+	mu         sync.Mutex
+	history    map[uint64]*Snapshot
+	Reloads    atomic.Uint64
+	Failures   atomic.Uint64
 }
 
 func NewManager(db *sql.DB) *Manager  { return &Manager{DB: db, history: map[uint64]*Snapshot{}} }
@@ -47,6 +50,9 @@ func (m *Manager) Reload(ctx context.Context) error {
 	if old := m.Current(); old != nil && old.Revision == rev {
 		return nil
 	}
+	if old := m.Current(); old != nil && rev < old.Revision {
+		return errors.New("configuration revision regressed")
+	}
 	s, err := m.History(ctx, rev)
 	if err != nil {
 		return err
@@ -64,6 +70,9 @@ func (m *Manager) Reload(ctx context.Context) error {
 	return nil
 }
 func (m *Manager) History(ctx context.Context, rev uint64) (*Snapshot, error) {
+	if active := m.Current(); active != nil && active.Revision == rev {
+		return active, nil
+	}
 	m.mu.Lock()
 	s := m.history[rev]
 	m.mu.Unlock()
@@ -91,6 +100,8 @@ func (m *Manager) History(ctx context.Context, rev uint64) (*Snapshot, error) {
 	return s, nil
 }
 func (m *Manager) LoadSecrets(sources map[string]SecretSource) ([32]byte, error) {
+	m.secretMu.Lock()
+	defer m.secretMu.Unlock()
 	values := map[string]string{}
 	for id, s := range sources {
 		if (s.File == "") == (s.Env == "") {
@@ -118,22 +129,33 @@ func (m *Manager) LoadSecrets(sources map[string]SecretSource) ([32]byte, error)
 			}
 		}
 	}
-	m.secrets.Store(&values)
-	// Hash only used for change detection, never emitted.
-	var joined strings.Builder
-	for id := range sources {
-		joined.WriteString(id)
-		joined.WriteString(values[id])
+	// JSON map serialization sorts keys, so unchanged Secret mounts do not
+	// trigger swaps. Hashes and secret contents are never emitted.
+	encoded, err := json.Marshal(values)
+	if err != nil {
+		return [32]byte{}, err
 	}
-	return sha256.Sum256([]byte(joined.String())), nil
+	hash := sha256.Sum256(encoded)
+	if hash != m.secretHash {
+		m.secrets.Store(&values)
+		m.secretHash = hash
+	}
+	return hash, nil
 }
 func (m *Manager) Watch(ctx context.Context, path string, p Process) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		slog.Error("file_watcher_failed")
-		return
+		m.Failures.Add(1)
+	} else {
+		defer w.Close()
 	}
-	defer w.Close()
+	var events <-chan fsnotify.Event
+	var watchErrors <-chan error
+	if w != nil {
+		events = w.Events
+		watchErrors = w.Errors
+	}
 	dirs := map[string]bool{filepath.Dir(path): true}
 	for _, s := range p.Secrets {
 		if s.File != "" {
@@ -141,6 +163,9 @@ func (m *Manager) Watch(ctx context.Context, path string, p Process) {
 		}
 	}
 	for d := range dirs {
+		if w == nil {
+			break
+		}
 		if err := w.Add(d); err != nil {
 			slog.Warn("watch_directory_failed", "directory", d)
 		}
@@ -165,7 +190,7 @@ func (m *Manager) Watch(ctx context.Context, path string, p Process) {
 			return
 		}
 		for _, s := range next.Secrets {
-			if s.File != "" && !dirs[filepath.Dir(s.File)] {
+			if w != nil && s.File != "" && !dirs[filepath.Dir(s.File)] {
 				d := filepath.Dir(s.File)
 				if w.Add(d) == nil {
 					dirs[d] = true
@@ -178,14 +203,16 @@ func (m *Manager) Watch(ctx context.Context, path string, p Process) {
 		select {
 		case <-ctx.Done():
 			return
-		case _, ok := <-w.Events:
+		case _, ok := <-events:
 			if !ok {
-				return
+				events = nil
+				continue
 			}
 			debounce.Reset(300 * time.Millisecond)
-		case _, ok := <-w.Errors:
+		case _, ok := <-watchErrors:
 			if !ok {
-				return
+				watchErrors = nil
+				continue
 			}
 			m.Failures.Add(1)
 		case <-debounce.C:

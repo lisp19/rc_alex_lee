@@ -17,11 +17,12 @@ import (
 	"net/netip"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
-	"notifier/internal/application"
 	"notifier/internal/config"
 	"notifier/internal/domain"
 )
@@ -29,6 +30,9 @@ import (
 type Adapter interface {
 	Deliver(context.Context, *domain.Notification, config.Target, config.Target, string) domain.Decision
 }
+
+var errPolicyBlocked = errors.New("destination blocked by policy")
+
 type HTTP struct {
 	mu         sync.Mutex
 	transports map[string]*http.Transport
@@ -81,7 +85,7 @@ func (h *HTTP) transport(behavior, security config.Endpoint) *http.Transport {
 			return nil, err
 		}
 		if !slices.Contains(security.Hosts, strings.ToLower(host)) {
-			return nil, errors.New("host blocked")
+			return nil, errPolicyBlocked
 		}
 		c, cancel := context.WithTimeout(ctx, behavior.ConnectTimeout.Duration())
 		defer cancel()
@@ -94,7 +98,7 @@ func (h *HTTP) transport(behavior, security config.Endpoint) *http.Transport {
 		}
 		for _, ip := range ips {
 			if !allowedIP(ip, security.CIDRs) {
-				return nil, errors.New("IP blocked")
+				return nil, errPolicyBlocked
 			}
 		}
 		var last error
@@ -120,7 +124,7 @@ func (h *HTTP) transport(behavior, security config.Endpoint) *http.Transport {
 func (h *HTTP) Deliver(ctx context.Context, n *domain.Notification, t, current config.Target, secret string) domain.Decision {
 	d := domain.Decision{Action: "fail", Started: time.Now().UTC()}
 	finish := func(reason string) domain.Decision { d.Reason = reason; d.Latency = time.Since(d.Started); return d }
-	if !current.Enabled || !slices.Contains(current.Endpoint.Methods, n.Request.Method) || !application.PathAllowed(current.Endpoint.Prefixes, n.Request.Path) || config.ValidatePath(n.Request.Path) != nil {
+	if !current.Enabled || !slices.Contains(current.Endpoint.Methods, n.Request.Method) || !config.PathAllowed(current.Endpoint.Prefixes, n.Request.Path) || config.ValidatePath(n.Request.Path) != nil {
 		return finish("target_policy_blocked")
 	}
 	u, err := url.Parse(t.Endpoint.BaseURL)
@@ -178,6 +182,7 @@ func (h *HTTP) Deliver(ctx context.Context, n *domain.Notification, t, current c
 	}
 	req.Header = headers
 	req.Header.Set("X-Notification-ID", n.ID.String())
+	req.Header.Set("X-Request-ID", domain.RequestID(ctx))
 	req.Header.Set("User-Agent", "notifier/1")
 	if current.Auth.Type == "static_header" {
 		if secret == "" {
@@ -188,9 +193,16 @@ func (h *HTTP) Deliver(ctx context.Context, n *domain.Notification, t, current c
 	client := http.Client{Transport: h.transport(t.Endpoint, current.Endpoint), CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	resp, err := client.Do(req)
 	if err != nil {
-		d.Action = "retry"
-		d.Uncertain = true
-		return finish("network_error")
+		if errors.Is(err, errPolicyBlocked) {
+			return finish("destination_blocked")
+		}
+		var ne net.Error
+		if errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.EPIPE) || (errors.As(err, &ne) && (ne.Timeout() || ne.Temporary())) {
+			d.Action = "retry"
+			d.Uncertain = true
+			return finish("network_error")
+		}
+		return finish("permanent_transport_error")
 	}
 	defer resp.Body.Close()
 	d.HTTPStatus = resp.StatusCode
@@ -222,7 +234,7 @@ func (h *HTTP) Deliver(ctx context.Context, n *domain.Notification, t, current c
 	default:
 		d.Action = "fail"
 	}
-	return finish("http_" + http.StatusText(resp.StatusCode))
+	return finish("http_" + strconv.Itoa(resp.StatusCode))
 }
 func injectJSON(body []byte, pointer, key string) ([]byte, error) {
 	var root any
@@ -235,25 +247,49 @@ func injectJSON(body []byte, pointer, key string) ([]byte, error) {
 		return nil, errors.New("invalid JSON")
 	}
 	parts := strings.Split(strings.TrimPrefix(pointer, "/"), "/")
-	current := root
 	for i, p := range parts {
-		p = strings.ReplaceAll(strings.ReplaceAll(p, "~1", "/"), "~0", "~")
-		obj, ok := current.(map[string]any)
-		if !ok {
-			return nil, errors.New("JSON pointer traverses non-object")
-		}
-		if i == len(parts)-1 {
-			obj[p] = key
-			break
-		}
-		child, ok := obj[p]
-		if !ok {
-			child = map[string]any{}
-			obj[p] = child
-		}
-		current = child
+		parts[i] = strings.ReplaceAll(strings.ReplaceAll(p, "~1", "/"), "~0", "~")
+	}
+	root, err := setPointer(root, parts, key)
+	if err != nil {
+		return nil, err
 	}
 	return json.Marshal(root)
+}
+
+func setPointer(node any, parts []string, value string) (any, error) {
+	if len(parts) == 0 {
+		return value, nil
+	}
+	switch v := node.(type) {
+	case map[string]any:
+		child, exists := v[parts[0]]
+		if !exists && len(parts) > 1 {
+			child = map[string]any{}
+		}
+		next, err := setPointer(child, parts[1:], value)
+		if err != nil {
+			return nil, err
+		}
+		v[parts[0]] = next
+		return v, nil
+	case []any:
+		if parts[0] == "-" && len(parts) == 1 {
+			return append(v, value), nil
+		}
+		i, err := strconv.Atoi(parts[0])
+		if err != nil || i < 0 || i >= len(v) || strconv.Itoa(i) != parts[0] {
+			return nil, errors.New("invalid JSON array pointer")
+		}
+		next, err := setPointer(v[i], parts[1:], value)
+		if err != nil {
+			return nil, err
+		}
+		v[i] = next
+		return v, nil
+	default:
+		return nil, errors.New("JSON pointer traverses scalar")
+	}
 }
 
 // Redact never retains an unstructured body whose sensitive fields cannot be
@@ -261,7 +297,7 @@ func injectJSON(body []byte, pointer, key string) ([]byte, error) {
 func Redact(d *domain.Decision, t config.Target, secret string) {
 	var body any
 	if json.Unmarshal(d.Preview, &body) == nil {
-		redactValue(body, t.SensitiveJSON, secret)
+		body = redactValue(body, t.SensitiveJSON, secret)
 		b, err := json.Marshal(body)
 		if err == nil {
 			d.Preview = b[:min(len(b), t.PreviewBytes)]
@@ -272,7 +308,7 @@ func Redact(d *domain.Decision, t config.Target, secret string) {
 	if len(d.Report) > 0 {
 		var report any
 		if json.Unmarshal(d.Report, &report) == nil {
-			redactValue(report, t.SensitiveJSON, secret)
+			report = redactValue(report, t.SensitiveJSON, secret)
 			b, err := json.Marshal(report)
 			if err == nil && len(b) <= 8192 {
 				d.Report = b
@@ -288,8 +324,11 @@ func Redact(d *domain.Decision, t config.Target, secret string) {
 			d.Headers[k] = strings.ReplaceAll(v, secret, "[REDACTED]")
 		}
 	}
+	if secret != "" && strings.Contains(d.Reason, secret) {
+		d.Reason = "redacted_reason"
+	}
 }
-func redactValue(v any, fields []string, secret string) {
+func redactValue(v any, fields []string, secret string) any {
 	switch x := v.(type) {
 	case map[string]any:
 		for k, val := range x {
@@ -298,7 +337,7 @@ func redactValue(v any, fields []string, secret string) {
 			} else if str, ok := val.(string); ok && secret != "" {
 				x[k] = strings.ReplaceAll(str, secret, "[REDACTED]")
 			} else {
-				redactValue(val, fields, secret)
+				x[k] = redactValue(val, fields, secret)
 			}
 		}
 	case []any:
@@ -306,9 +345,14 @@ func redactValue(v any, fields []string, secret string) {
 			if str, ok := val.(string); ok && secret != "" {
 				x[i] = strings.ReplaceAll(str, secret, "[REDACTED]")
 			} else {
-				redactValue(val, fields, secret)
+				x[i] = redactValue(val, fields, secret)
 			}
 		}
+	case string:
+		if secret != "" {
+			return strings.ReplaceAll(x, secret, "[REDACTED]")
+		}
 	}
+	return v
 }
 func BodyHashString(d domain.Decision) string { return hex.EncodeToString(d.BodyHash) }

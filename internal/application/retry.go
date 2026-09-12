@@ -20,6 +20,15 @@ func (s *Service) Retry(ctx context.Context, client string, id domain.ID, snap *
 	if n.Status != "failed" {
 		return domain.ErrState
 	}
+	if s.Quota != nil {
+		ok, err := s.Quota.Ingress(ctx, client, snap.Quotas[snap.Clients[client].Quota])
+		if err != nil {
+			return Fail("DEPENDENCY_UNAVAILABLE", 503, "quota unavailable")
+		}
+		if !ok {
+			return Fail("QUOTA_EXCEEDED", 429, "ingress quota exceeded")
+		}
+	}
 	history, err := s.Config.History(ctx, n.ConfigRevision)
 	if err != nil {
 		return err

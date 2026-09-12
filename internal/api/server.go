@@ -35,6 +35,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/notifications", s.list)
 	mux.HandleFunc("GET /api/v1/notifications/{id}", s.get)
 	mux.HandleFunc("POST /api/v1/notifications/{action}", s.retry)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, caller(r).requestID, application.Fail("INVALID_REQUEST", 404, "API route not found"))
+	})
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := domain.NewID().String()
 		w.Header().Set("X-Request-ID", id)
@@ -48,6 +51,7 @@ func (s *Server) Handler() http.Handler {
 		ctx, cancel := context.WithTimeout(r.Context(), 40*time.Second)
 		defer cancel()
 		ctx = context.WithValue(ctx, identityKey{}, identity{client, snap, id})
+		ctx = domain.WithRequestID(ctx, id)
 		defer func() {
 			if p := recover(); p != nil {
 				slog.Error("api_panic", "request_id", id)
@@ -154,6 +158,19 @@ func (s *Server) batch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, a.requestID, application.Fail("INVALID_REQUEST", 400, "batch must contain 1..100 items"))
 		return
 	}
+	// Charge the envelope too, so invalid-only batches cannot bypass admission
+	// control while creating unbounded batch metadata.
+	if limiter := s.Service.Quota; limiter != nil {
+		ok, err := limiter.Ingress(r.Context(), a.client, a.snapshot.Quotas[a.snapshot.Clients[a.client].Quota])
+		if err != nil {
+			writeError(w, a.requestID, application.Fail("DEPENDENCY_UNAVAILABLE", 503, "quota unavailable"))
+			return
+		}
+		if !ok {
+			writeError(w, a.requestID, application.Fail("QUOTA_EXCEEDED", 429, "ingress quota exceeded"))
+			return
+		}
+	}
 	id := domain.NewID()
 	if err := s.Service.Store.CreateBatch(r.Context(), id, a.client, len(body.Items)); err != nil {
 		writeError(w, a.requestID, err)
@@ -166,7 +183,10 @@ func (s *Server) batch(w http.ResponseWriter, r *http.Request) {
 		var n *domain.Notification
 		if err != nil {
 			err = application.Fail("INVALID_REQUEST", 400, "invalid batch item")
+		} else if in.Mode == "proxy" {
+			err = application.Fail("INVALID_REQUEST", 400, "batch only supports async delivery")
 		} else {
+			in.Mode = "async"
 			n, _, err = s.Service.Accept(r.Context(), a.client, in, &id, a.snapshot)
 		}
 		out := map[string]any{"idempotency_key": in.Key, "accepted": err == nil}

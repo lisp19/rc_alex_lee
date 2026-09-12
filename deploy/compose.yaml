@@ -1,0 +1,74 @@
+name: notifier
+services:
+  mariadb:
+    image: mariadb:11.8
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?run local-setup first}
+      DB_BUSINESS_PASSWORD: ${DB_BUSINESS_PASSWORD:?required}
+      DB_CONTROL_PASSWORD: ${DB_CONTROL_PASSWORD:?required}
+      DB_ADMIN_PASSWORD: ${DB_ADMIN_PASSWORD:?required}
+    volumes:
+      - database:/var/lib/mysql
+      - ../migrations/001_business.sql:/docker-entrypoint-initdb.d/001_business.sql:ro
+      - ../migrations/002_control.sql:/docker-entrypoint-initdb.d/002_control.sql:ro
+      - ./local/init-users.sh:/docker-entrypoint-initdb.d/003_users.sh:ro
+    healthcheck:
+      test: [CMD, healthcheck.sh, --connect, --innodb_initialized]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  redis:
+    image: redis:8.10.1
+    command: [redis-server, --appendonly, 'no']
+  rabbitmq:
+    image: rabbitmq:4.3.5-management
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: notifier
+      RABBITMQ_DEFAULT_PASS: ${AMQP_PASSWORD:?required}
+    volumes: [rabbitmq:/var/lib/rabbitmq]
+    ports: ['127.0.0.1:15672:15672']
+  mock-target:
+    image: notifier:local
+    build: {context: ..}
+    entrypoint: [/mock-target]
+    command: [-listen, ':8080']
+    ports: ['127.0.0.1:18080:8080']
+  config-init:
+    image: notifier:local
+    build: {context: ..}
+    entrypoint: [/notify-admin]
+    command: [-file, /etc/notifier/management.json, -apply, -actor, local-compose]
+    environment:
+      NOTIFIER_ADMIN_DSN: 'notify_admin_control:${DB_ADMIN_PASSWORD}@tcp(mariadb:3306)/notify_control'
+    volumes: ['../configs/secrets/management.json:/etc/notifier/management.json:ro']
+    depends_on:
+      mariadb: {condition: service_healthy}
+  notifier:
+    image: notifier:local
+    build: {context: ..}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 55s
+    environment:
+      NOTIFIER_CONFIG: /etc/notifier/notifier.json
+      NOTIFIER_BUSINESS_DSN: 'notify_runtime_business:${DB_BUSINESS_PASSWORD}@tcp(mariadb:3306)/notify_business'
+      NOTIFIER_CONTROL_DSN: 'notify_runtime_control:${DB_CONTROL_PASSWORD}@tcp(mariadb:3306)/notify_control'
+      NOTIFIER_AMQP_URL: 'amqp://notifier:${AMQP_PASSWORD}@rabbitmq:5672/'
+      NOTIFIER_REDIS_URL: redis://redis:6379/0
+    volumes: ['../configs/secrets/notifier.json:/etc/notifier/notifier.json:ro']
+    ports: ['127.0.0.1:8080:8080', '127.0.0.1:8081:8081']
+    depends_on:
+      config-init: {condition: service_completed_successfully}
+      redis: {condition: service_started}
+      rabbitmq: {condition: service_started}
+      mock-target: {condition: service_started}
+volumes:
+  database: {}
+  rabbitmq: {}
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24

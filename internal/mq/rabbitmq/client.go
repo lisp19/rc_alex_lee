@@ -19,23 +19,36 @@ type Client struct {
 	URL             string
 	mu              sync.Mutex
 	conn            *amqp.Connection
+	observed        atomic.Pointer[amqp.Connection]
 	Closed          bool
 	PublishFailures atomic.Uint64
 	ConsumeFailures atomic.Uint64
 	Active          atomic.Int64
 }
 
-func (c *Client) channel() (*amqp.Channel, error) {
+func (c *Client) connection() (*amqp.Connection, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.Closed {
 		return nil, errors.New("MQ closed")
 	}
 	if c.conn == nil || c.conn.IsClosed() {
-		conn, err := amqp.DialConfig(c.URL, amqp.Config{Heartbeat: 10 * time.Second, Locale: "en_US", Dial: func(network, addr string) (net.Conn, error) { return net.DialTimeout(network, addr, 5*time.Second) }})
+		conn, err := amqp.DialConfig(c.URL, amqp.Config{Heartbeat: 10 * time.Second, Locale: "en_US", Dial: func(network, addr string) (net.Conn, error) {
+			conn, err := net.DialTimeout(network, addr, 5*time.Second)
+			if err != nil {
+				return nil, err
+			}
+			if err = conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				conn.Close()
+				return nil, err
+			}
+			return boundedConn{conn}, nil
+		}})
 		if err != nil {
 			return nil, errors.New("AMQP connect failed")
 		}
+		timeout := time.AfterFunc(10*time.Second, func() { _ = conn.CloseDeadline(time.Now()) })
+		defer timeout.Stop()
 		ch, err := conn.Channel()
 		if err != nil {
 			conn.Close()
@@ -48,8 +61,18 @@ func (c *Client) channel() (*amqp.Channel, error) {
 		}
 		ch.Close()
 		c.conn = conn
+		c.observed.Store(conn)
 	}
-	return c.conn.Channel()
+	return c.conn, nil
+}
+func (c *Client) channel() (*amqp.Channel, error) {
+	conn, err := c.connection()
+	if err != nil {
+		return nil, err
+	}
+	timeout := time.AfterFunc(10*time.Second, func() { _ = conn.CloseDeadline(time.Now()) })
+	defer timeout.Stop()
+	return conn.Channel()
 }
 func topology(ch *amqp.Channel) error {
 	for _, x := range []string{"notify.dispatch.x", "notify.retry.x", "notify.dead.x"} {
@@ -82,9 +105,8 @@ func topology(ch *amqp.Channel) error {
 	return nil
 }
 func (c *Client) Ready() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.conn != nil && !c.conn.IsClosed() && !c.Closed
+	conn := c.observed.Load()
+	return conn != nil && !conn.IsClosed()
 }
 func (c *Client) Ensure() error {
 	ch, err := c.channel()
@@ -97,8 +119,9 @@ func (c *Client) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.Closed = true
+	c.observed.Store(nil)
 	if c.conn != nil {
-		if err := c.conn.Close(); err != nil {
+		if err := c.conn.CloseDeadline(time.Now().Add(time.Second)); err != nil {
 			slog.Debug("mq_close_failed")
 		}
 	}
@@ -108,6 +131,13 @@ func (c *Client) Publish(ctx context.Context, o *domain.Outbox) error {
 	if err != nil {
 		return err
 	}
+	conn := c.observed.Load()
+	stopTimeout := context.AfterFunc(ctx, func() {
+		if conn != nil {
+			_ = conn.CloseDeadline(time.Now())
+		}
+	})
+	defer stopTimeout()
 	defer ch.Close()
 	if err = ch.Confirm(false); err != nil {
 		return err

@@ -73,7 +73,7 @@ func (s *Service) Accept(ctx context.Context, client string, in domain.Submissio
 	if err != nil {
 		return nil, false, err
 	}
-	if !slices.Contains(t.Endpoint.Methods, in.Request.Method) || !PathAllowed(t.Endpoint.Prefixes, in.Request.Path) {
+	if !slices.Contains(t.Endpoint.Methods, in.Request.Method) || !config.PathAllowed(t.Endpoint.Prefixes, in.Request.Path) {
 		return nil, false, Fail("TARGET_NOT_ALLOWED", 403, "request violates target allowlist")
 	}
 	for k := range in.Request.Headers {
@@ -108,7 +108,7 @@ func (s *Service) Accept(ctx context.Context, client string, in domain.Submissio
 	}
 	if created {
 		s.Accepted.Add(1)
-		slog.Info("notification_accepted", "notification_id", n.ID, "client_id", client, "target_id", n.Target, "config_revision", snap.Revision)
+		slog.Info("notification_accepted", "request_id", domain.RequestID(ctx), "notification_id", n.ID, "batch_id", n.Batch, "client_id", client, "target_id", n.Target, "config_revision", snap.Revision)
 	}
 	return n, created, nil
 }
@@ -125,14 +125,6 @@ func Allowed(s *config.Snapshot, client, target string) (config.Target, error) {
 		return t, Fail("TARGET_DISABLED", 403, "target disabled")
 	}
 	return t, nil
-}
-func PathAllowed(prefixes []string, p string) bool {
-	for _, prefix := range prefixes {
-		if strings.HasPrefix(p, prefix) {
-			return true
-		}
-	}
-	return false
 }
 func normalize(r *domain.Request) error {
 	if err := config.ValidatePath(r.Path); err != nil {
@@ -160,6 +152,10 @@ func normalize(r *domain.Request) error {
 	}
 	if len(body) > 1<<20 {
 		return errors.New("notification body exceeds 1 MiB")
+	}
+	if utf8.Valid(body) {
+		r.BodyEncoding = "utf8"
+		r.Body = string(body)
 	}
 	if len(r.Headers) > 64 || len(r.Query) > 128 {
 		return errors.New("too many headers or query parameters")

@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +37,12 @@ func Build(revision uint64, b []byte) (*Snapshot, error) {
 	if err := Decode(b, &s.Document); err != nil {
 		return nil, err
 	}
+	if s.Targets == nil || s.Clients == nil || s.Retries == nil || s.Quotas == nil || s.Hooks == nil || s.Issuers == nil {
+		return nil, errors.New("all management entity maps are required")
+	}
+	if len(s.Targets) > 10000 || len(s.Clients) > 10000 || len(s.Hooks) > 1000 || len(b) > 16<<20 {
+		return nil, errors.New("configuration size limit exceeded")
+	}
 	env, err := cel.NewEnv(cel.Variable("status", cel.IntType), cel.Variable("headers", cel.MapType(cel.StringType, cel.StringType)), cel.Variable("body", cel.StringType), cel.Variable("json", cel.DynType), cel.Variable("notification", cel.MapType(cel.StringType, cel.StringType)), cel.Variable("attempt", cel.IntType), cel.ParserRecursionLimit(32), cel.ParserExpressionSizeLimit(8192))
 	if err != nil {
 		return nil, err
@@ -50,6 +57,9 @@ func Build(revision uint64, b []byte) (*Snapshot, error) {
 		}
 		if len(ast.SourceInfo().GetPositions()) > 512 {
 			return nil, fmt.Errorf("hook %s AST too large", id)
+		}
+		if typ := ast.OutputType().TypeName(); typ != "map" && typ != "dyn" {
+			return nil, fmt.Errorf("hook %s must return a map", id)
 		}
 		p, err := env.Program(ast, cel.CostLimit(10000), cel.InterruptCheckFrequency(32))
 		if err != nil {
@@ -67,9 +77,16 @@ func Build(revision uint64, b []byte) (*Snapshot, error) {
 			}
 		}
 	}
+	var global *Quota
 	for id, q := range s.Quotas {
 		if !namePattern.MatchString(id) || (q.FailMode != "open" && q.FailMode != "closed") || q.IngressGlobal < 0 || q.IngressClient < 0 || q.EgressTarget < 0 || q.EgressClientTarget < 0 || q.GlobalConcurrency < 0 || q.TargetConcurrency < 0 {
 			return nil, fmt.Errorf("invalid quota %s", id)
+		}
+		if global == nil {
+			copy := q
+			global = &copy
+		} else if global.IngressGlobal != q.IngressGlobal || global.GlobalConcurrency != q.GlobalConcurrency {
+			return nil, errors.New("global quota limits must agree across policies")
 		}
 	}
 	for id, t := range s.Targets {
@@ -102,6 +119,12 @@ func Build(revision uint64, b []byte) (*Snapshot, error) {
 		if !slices.Contains([]string{"supported", "unsupported", "unknown"}, t.Idempotency.Mode) {
 			return nil, errors.New("invalid idempotency mode")
 		}
+		if t.Idempotency.Mode == "supported" && len(t.Idempotency.Inject) == 0 {
+			return nil, errors.New("supported idempotency requires injection")
+		}
+		if t.Idempotency.Mode != "supported" && len(t.Idempotency.Inject) > 0 {
+			return nil, errors.New("idempotency injection requires supported mode")
+		}
 		if t.RetryEnabled && t.Idempotency.Mode != "supported" {
 			if t.Idempotency.UncertainRetry == nil {
 				return nil, errors.New("non-idempotent retry requires explicit allow_uncertain_retry")
@@ -121,6 +144,14 @@ func Build(revision uint64, b []byte) (*Snapshot, error) {
 			case "body_json":
 				if !strings.HasPrefix(in.Pointer, "/") || len(in.Pointer) > 512 {
 					return nil, errors.New("invalid JSON pointer")
+				}
+				for i := 0; i < len(in.Pointer); i++ {
+					if in.Pointer[i] == '~' {
+						if i+1 >= len(in.Pointer) || (in.Pointer[i+1] != '0' && in.Pointer[i+1] != '1') {
+							return nil, errors.New("invalid JSON pointer escape")
+						}
+						i++
+					}
 				}
 			default:
 				return nil, errors.New("unsupported idempotency injection")
@@ -158,6 +189,9 @@ func Build(revision uint64, b []byte) (*Snapshot, error) {
 			}
 			if err != nil {
 				return nil, fmt.Errorf("issuer %s key %s: %w", iss, kid, err)
+			}
+			if k, ok := key.(*rsa.PublicKey); ok && k.N.BitLen() < 2048 {
+				return nil, errors.New("RSA key must be at least 2048 bits")
 			}
 			s.Keys[iss][kid] = key
 		}
@@ -212,6 +246,15 @@ func ValidatePath(p string) error {
 	}
 	return nil
 }
+
+func PathAllowed(prefixes []string, p string) bool {
+	for _, prefix := range prefixes {
+		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
+}
 func ValidHeader(s string) bool {
 	if s == "" || len(s) > 128 {
 		return false
@@ -227,6 +270,6 @@ func ForbiddenTransportHeader(s string) bool {
 	return slices.Contains([]string{"host", "connection", "content-length", "transfer-encoding", "trailer", "te", "upgrade", "proxy-authorization", "proxy-connection"}, strings.ToLower(s))
 }
 func SensitiveHeader(s string) bool {
-	s = strings.ToLower(s)
-	return strings.Contains(s, "authorization") || strings.Contains(s, "cookie") || strings.Contains(s, "api-key") || strings.Contains(s, "apikey") || strings.Contains(s, "token") || strings.Contains(s, "secret")
+	s = strings.ReplaceAll(strings.ToLower(s), "_", "-")
+	return strings.Contains(s, "authorization") || strings.Contains(s, "cookie") || strings.Contains(s, "api-key") || strings.Contains(s, "apikey") || strings.Contains(s, "token") || strings.Contains(s, "secret") || strings.Contains(s, "password") || strings.Contains(s, "passwd")
 }

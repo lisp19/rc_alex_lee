@@ -115,4 +115,11 @@ func VersionKey(id string, revision uint64) string { return fmt.Sprintf("%s@%d",
 
 var Buckets = []time.Duration{5 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute, 30 * time.Minute, 2 * time.Hour, 6 * time.Hour}
 
-func BucketRoute(d time.Duration) string { return fmt.Sprintf("retry.%ds", int64(d/time.Second)) }
+func BucketRoute(d time.Duration) string {
+	for i, bucket := range Buckets {
+		if d == bucket {
+			return "retry." + []string{"5s", "30s", "2m", "10m", "30m", "2h", "6h"}[i]
+		}
+	}
+	return ""
+}
